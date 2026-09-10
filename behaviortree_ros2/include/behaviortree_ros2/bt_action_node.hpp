@@ -394,6 +394,13 @@ inline NodeStatus RosActionNode<T>::tick()
     setStatus(NodeStatus::RUNNING);
 
     goal_received_ = false;
+    // Without this, goal_handle_ still points at the PREVIOUS goal, which the
+    // client erased when its result arrived. cancelGoal() uses
+    // `if(!goal_handle_)` as its proxy for "handle not harvested yet", so a
+    // stale one sends it down the already-accepted path: async_get_result()
+    // throws UnknownGoalHandleError on the line before async_cancel_goal(),
+    // and a halt between dispatch and acceptance cancels nothing at all.
+    goal_handle_.reset();
     future_goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
     result_ = {};
@@ -420,7 +427,12 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-      if(goal_handle_->get_goal_id() == result.goal_id)
+      // goal_handle_ is null between the IDLE reset above and the harvest in
+      // the RUNNING branch, and spin_some() runs callbacks inside that window,
+      // so a late result from the previous goal can arrive while it is unset.
+      // Before goal_handle_ was reset it was merely stale here, never null,
+      // which is why this dereference was unguarded.
+      if(goal_handle_ && goal_handle_->get_goal_id() == result.goal_id)
       {
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
@@ -547,6 +559,17 @@ inline void RosActionNode<T>::cancelGoal()
       {
         goal_handle_ = future_goal_handle_.get();
         future_goal_handle_ = {};
+        if(!goal_handle_)
+        {
+          // The server rejected the goal, so the future resolved to a null
+          // handle. There is nothing to cancel, and async_get_result() below
+          // would dereference it: rclcpp_action reads goal_handle->get_goal_id()
+          // with no null check of its own.
+          RCLCPP_WARN(logger(), "cancelGoal: goal was rejected by [%s], nothing "
+                                "to cancel",
+                      action_name_.c_str());
+          return;
+        }
       }
     }
     else
